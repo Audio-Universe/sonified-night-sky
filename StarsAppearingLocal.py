@@ -44,12 +44,6 @@ import tqdm
 
 
 
-# Where the repository's own assets live. Worked out from this file rather
-# than from the working directory, so that the module can be imported, or run
-# as a script, from anywhere - including from `examples/multimedia/` itself.
-REPO = Path(__file__).resolve().parent.parent.parent
-PANORAMAS = REPO / "data" / "panoramas"
-
 # Native size of each NASA star map, and so of a "full" render. Both are 2:1,
 # the shape of a 360 x 180 degree panorama - a frame of any other shape holds
 # the same sky stretched.
@@ -128,7 +122,7 @@ class Config:
     # its centre. One of
     #   "auto"  - render one to match every setting above, from NASA's all-sky
     #             star map, so that the pulses land on the stars drawn in it
-    #   a path  - use that image as it is, e.g. `PANORAMAS / "sherwood_sky.png"`
+    #   a path  - use that image as it is, e.g. `"my_sky.png"`
     #   None    - a plain black sky
     background: Path | str | None = "auto"
 
@@ -276,6 +270,74 @@ def observed_sky(cfg):
     sky["magnitude"] += 1e-2 * rng.random(len(sky))
 
     return sky.sort_values("magnitude")
+
+
+def star_frame(sky, cfg):
+    """The columns the `stars_appearing` style asks for, one row per star.
+
+    The column names are the style's `input:` names - `sonify` matches a
+    `DataFrame` to a style by name - and this is where the observer's own
+    point of view is applied, which is the part no style file could do:
+
+      - `azimuth` strauss measures **anticlockwise from straight ahead**,
+        while astronomical azimuth runs **clockwise from north**, so it is
+        the facing direction *minus* the star's azimuth.
+      - `polar` is measured from the zenith down, not the horizon up.
+      - `volume` quietens the dimmer stars. They are far more numerous, so
+        without this the piece grows steadily louder as it goes.
+      - `pitch_shift` detunes each note very slightly, so that the many
+        stars sharing a note do not phase against one another.
+
+    Args:
+      sky (:obj:`pandas.DataFrame`): as `observed_sky` returns.
+
+    Returns:
+      frame (:obj:`pandas.DataFrame`): ready for `strauss.sonify`, indexed
+        by `HIP<number>` so each note can be traced back to its star.
+    """
+    smag = unit_scale(sky["magnitude"].to_numpy(float))
+    rng = np.random.default_rng(cfg.seed + 1)
+
+    return pd.DataFrame({
+        "magnitude": sky["magnitude"].to_numpy(float),
+        "colour":    sky["bv"].to_numpy(float),
+        "azimuth":   (facing_degrees(cfg.facing) - sky["az"].to_numpy(float)) % 360,
+        "polar":     90.0 - sky["alt"].to_numpy(float),
+        "volume":    (1 - smag) ** 0.5,
+        "pitch_shift": 5e-3 * rng.random(len(sky)),
+    }, index=[f"HIP{hip}" for hip in sky.index])
+
+
+def sonified_events(frame):
+    """What sounded and when, read back out of the rendered sonification.
+
+    This is the join between sound and picture: the animation takes its
+    timings from here rather than working them out again, so the two
+    cannot drift apart.
+
+    Args:
+      frame (:obj:`pandas.DataFrame`): the frame that was sonified, for
+        the magnitude and colour each pulse is drawn with.
+
+    Returns:
+      events (:obj:`pandas.DataFrame`): a row per note, in time order,
+        with its time in seconds and its angles in degrees.
+    """
+    import strauss
+
+    # the units sit in a second column level, which is for reading rather
+    # than for arithmetic - drop to the plain names before touching the
+    # numbers
+    flat = strauss.get_table().copy()
+    flat.columns = flat.columns.get_level_values(0)
+
+    events = pd.DataFrame({
+        "time":    flat["Time"].to_numpy(float),
+        "azimuth": flat["Azimuthal Angle"].to_numpy(float),
+        "polar":   flat["Polar Angle"].to_numpy(float),
+    }, index=flat["Source"].to_numpy())
+
+    return events.join(frame[["magnitude", "colour"]]).sort_values("time")
 
 
 # <u> __The background sky:__ </u>
@@ -572,6 +634,44 @@ def restyle(base="stars_appearing", sample=None, notes=None, name=None,
     return str(out_path)
 
 
+# the sounds to choose between, as the notebooks offer them
+SOUNDS = ["Night Harp", "Stars Appearing"]
+
+
+def chosen_style(sound="Night Harp", cfg=None):
+    """The style to sonify with, for one of the sounds in `SOUNDS`.
+
+    `"Stars Appearing"` is the glockenspiel of the original planetarium
+    piece, and is the `stars_appearing` style as it ships. `"Night Harp"`
+    keeps that same recipe and swaps only the sound it is made of - the
+    Suite's harp samples, fetched once, and the chord of its own "Night
+    Harp" style - so every mapping is left as it is.
+
+    Args:
+      sound (`optional`, :obj:`str`): one of `SOUNDS`.
+      cfg (`optional`, :obj:`Config`): for the sample cache, and for where
+        a restyled style file is written.
+
+    Returns:
+      style (:obj:`str`): a style name or path, for `strauss.sonify`.
+    """
+    if sound not in SOUNDS:
+        raise ValueError(f"'{sound}' is not a sound. Choose from {SOUNDS}.")
+
+    if sound == "Stars Appearing":
+        return "stars_appearing"
+
+    cfg = cfg or Config()
+    return restyle("stars_appearing",
+                   sample=suite_samples("Harp", cfg.cache),
+                   notes=NIGHT_HARP_NOTES,
+                   name="Stars Appearing (Night Harp)",
+                   description="Brightest stars appear first, pitch mapped to "
+                               "colour. Harp and chord from the Sonification "
+                               "Suite's 'Night Harp'.",
+                   out_path=cfg.outdir / "stars_appearing_harp.yml")
+
+
 # <u> __The animation:__ </u>
 #
 # Each star is a pulse that swells and fades as its note sounds. Frames are
@@ -828,3 +928,76 @@ def write_videos(cfg, events, audio, targets=None, sky=None):
 def write_video(cfg, events, audio, out_path, dome=False, sky=None):
     """Render every frame into a single ffmpeg process, ignoring `cfg.output`."""
     return write_videos(cfg, events, audio, [(out_path, dome)], sky=sky)[0]
+
+
+# <u> __The whole sequence:__ </u>
+#
+# Everything above, in the order it has to happen, for the times you want the
+# finished thing rather than a look at how it is made. `StarsAppearingLocal.ipynb`
+# is the same run with each step in the open; `StarsAppearingColab.ipynb` is this
+# one call behind a form.
+
+@dataclass
+class Sequence:
+    """What one run of `make_sequence` produced."""
+
+    cfg: Config
+    sky: pd.DataFrame           # the stars, as `observed_sky` returned them
+    frame: pd.DataFrame         # what was sonified
+    events: pd.DataFrame        # what sounded, and when
+    style: str                  # the style it was sonified with
+    background: Path | None     # the panorama the stars were drawn over
+    audio: Path                 # the rendered sonification
+    videos: list                # the videos written, panorama first
+
+
+def make_sequence(cfg, sound="Night Harp"):
+    """Sky to finished video, in one call.
+
+    Args:
+      cfg (:obj:`Config`): every setting for the run.
+      sound (`optional`, :obj:`str`): one of `SOUNDS`.
+
+    Returns:
+      result (:obj:`Sequence`): the outputs, and the tables behind them.
+    """
+    import strauss
+
+    cfg.outdir.mkdir(parents=True, exist_ok=True)
+
+    sky = observed_sky(cfg)
+    background = resolve_background(cfg)
+
+    frame = star_frame(sky, cfg)
+    style = chosen_style(sound, cfg)
+
+    strauss.sonify(frame, style=style, channels=cfg.system,
+                   duration=cfg.duration, angle_unit="degrees",
+                   source_names=list(frame.index))
+    events = sonified_events(frame)
+
+    audio = cfg.outdir / "stars_appearing.wav"
+    strauss.save(str(audio))
+
+    # a re-run should start clean rather than adding a second sonification
+    # alongside the first
+    strauss.close()
+
+    videos = write_videos(cfg, events, audio, sky=background)
+
+    return Sequence(cfg=cfg, sky=sky, frame=frame, events=events, style=style,
+                    background=background, audio=audio, videos=videos)
+
+
+def show_videos(paths):
+    """Play the finished videos in the notebook.
+
+    The file is embedded rather than linked, since a notebook served from
+    somewhere other than the working directory - `Colab`, say - cannot
+    reach it by path.
+    """
+    from IPython.display import Video, display
+
+    for path in paths:
+        print(f"{Path(path).stat().st_size / 1e6:8.1f} MB  {path}")
+        display(Video(str(path), embed=True))
