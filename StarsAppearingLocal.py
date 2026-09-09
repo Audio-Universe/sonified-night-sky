@@ -1227,15 +1227,20 @@ def output_files(result):
 
 
 def download_outputs(result):
-    """Offer each file this run wrote as a download button.
+    """Offer each file this run wrote as a download.
 
     On `Colab` the outputs are written to a machine that is thrown away when
     the session ends, and the file browser they are sitting in is not an
-    obvious place to look. `google.colab.files.download` is the same call the
-    file browser's own download button makes; hanging it off a click rather
-    than running it as the cell runs means the browser sees a download the
-    reader asked for, rather than one a page started by itself, which is the
-    kind it blocks.
+    obvious place for a newcomer to look.
+
+    The download itself is `google.colab.files.download`, the same call the
+    file browser's own download button makes, driven from Python rather than
+    from JavaScript in the output: `IPython.display.HTML` is rendered in a
+    sandboxed frame with inline handlers like `onclick` stripped, so a button
+    written that way is displayed but does nothing when pressed. An
+    `ipywidgets` button carries its click back to the kernel instead, which
+    keeps the download coming from a press rather than from the cell - and
+    where `ipywidgets` is missing, the files simply download as the cell runs.
 
     Run anywhere else the files are already on your own machine, so there is
     nothing to download and the paths are printed instead.
@@ -1244,49 +1249,55 @@ def download_outputs(result):
       result (:obj:`Sequence`, :obj:`list` or :obj:`pathlib.Path`): a run, as
         `make_sequence` returns it, or the paths themselves.
     """
-    import html
-
-    from IPython.display import HTML, display
-
     paths = [p for p in output_files(result) if p.exists()]
 
     try:
-        import google.colab  # noqa: F401
+        from google.colab import files
     except ImportError:
         print("Your files are here:")
         for path in paths:
             print(f"  {path.stat().st_size / 1e6:8.1f} MB  {path.resolve()}")
         return paths
 
-    buttons, bulky = [], []
+    print("These files are deleted when the Colab session ends, so download "
+          "anything you want to keep:")
     for path in paths:
-        size = path.stat().st_size / 1e6
-        if size >= DRIVE_ADVISED_MB:
-            bulky.append(path)
+        print(f"  {path.stat().st_size / 1e6:8.1f} MB  {path.name}")
 
-        # the path goes into the page as a JavaScript string inside an HTML
-        # attribute, so it is quoted for both
-        arg = html.escape(json.dumps(str(path.resolve())), quote=True)
-        buttons.append(
-            f"<div style='margin:6px 0'>"
-            f"<button onclick='google.colab.files.download({arg})' "
-            f"style='font-size:14px;padding:8px 14px;margin-right:10px;"
-            f"cursor:pointer;border-radius:6px;border:1px solid #999'>"
-            f"&#11015;&#160; Download {html.escape(path.name)}</button>"
-            f"<span style='color:#666'>{size:.1f} MB</span></div>")
-
-    note = ("<p style='color:#666;margin-top:10px'>These files are deleted "
-            "when the Colab session ends, so download anything you want to "
-            "keep.</p>")
+    bulky = [p for p in paths if p.stat().st_size / 1e6 >= DRIVE_ADVISED_MB]
     if bulky:
-        note += ("<p style='color:#666'>A file this large can be slow or "
-                 "unreliable through the browser. To put it in your Google "
-                 "Drive instead, run:<br>"
-                 "<code>from google.colab import drive; "
-                 "drive.mount('/content/drive')</code><br>"
-                 "<code>!cp " + " ".join(html.escape(str(p)) for p in bulky)
-                 + " /content/drive/MyDrive/</code></p>")
+        print("\nA file this large can be slow or unreliable through the "
+              "browser. To put it in your Google Drive instead, run:\n"
+              "  from google.colab import drive\n"
+              "  drive.mount('/content/drive')\n"
+              f"  !cp {' '.join(str(p) for p in bulky)} /content/drive/MyDrive/")
 
-    display(HTML("".join(buttons) + note))
+    try:
+        import ipywidgets
+    except ImportError:
+        for path in paths:
+            files.download(str(path))
+        return paths
+
+    from IPython.display import display
+
+    # `files.download` reaches the browser by way of the cell it is running
+    # in, and a button press runs in no cell at all - so the presses are given
+    # an `Output` to happen inside, which is that context
+    context = ipywidgets.Output()
+
+    def button(path):
+        widget = ipywidgets.Button(description=f"Download {path.name}",
+                                   icon="download",
+                                   layout=ipywidgets.Layout(width="auto"))
+
+        def press(_widget):
+            with context:
+                files.download(str(path))
+
+        widget.on_click(press)
+        return widget
+
+    display(ipywidgets.VBox([button(path) for path in paths] + [context]))
 
     return paths
