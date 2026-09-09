@@ -44,14 +44,19 @@ import tqdm
 
 
 
-# Native size of each NASA star map, and so of a "full" render. Both are 2:1,
-# the shape of a 360 x 180 degree panorama - a frame of any other shape holds
-# the same sky stretched.
+# Native size of each NASA star map. Both are 2:1, the shape of a 360 x 180
+# degree panorama - a frame of any other shape holds the same sky stretched.
 STARMAP_SIZES = {"4k": (4096, 2048), "8k": (8192, 4096)}
 
-# Frame sizes small enough to render while you are still choosing a site and
-# a night. 'full' is not here: it comes from the star map, above.
-SIZES = {"fast_preview": (512, 256), "preview": (1024, 512)}
+# The four frame sizes to choose between, smallest first. The two previews
+# are for while you are still choosing a site and a night; the two above them
+# are the native sizes of the star maps, so that a map's pixels are used as
+# they are rather than resampled. Each dome master comes out square at the
+# frame's height, so 'full' is the one that gives a 4096-a-side dome.
+SIZES = {"fast_preview": (512, 256),
+         "preview": (1024, 512),
+         "high": STARMAP_SIZES["4k"],
+         "full": STARMAP_SIZES["8k"]}
 
 
 # <u> __Settings:__ </u>
@@ -87,14 +92,17 @@ class Config:
 
     # -- the picture -----------------------------------------------------
     # frame size: either a name, or an explicit `(width, height)`.
-    #   'full'         - the native size of the star map chosen below, so that
-    #                    its pixels are used as they are rather than resampled
+    #   'fast_preview' - 512 x 256, quickest of all
     #   'preview'      - 1024 x 512, for while you are still deciding
-    #   'fast_preview' - 512 x 256, quicker still
+    #   'high'         - 4096 x 2048, the 4k star map used as it is, and a
+    #                    2048-a-side dome master
+    #   'full'         - 8192 x 4096, the 8k star map used as it is, and a
+    #                    4096-a-side dome master. Slow, and worth it only
+    #                    where the dome really is that big.
     # The named sizes are all 2:1, matching a 360 x 180 degree panorama. Give
     # a pair of your own if you need some other shape; the sky will be
     # stretched to fill it, and the star pulses stretched to match.
-    size: str | tuple = "full"
+    size: str | tuple = "high"
     fps: int = 30
 
     # filled in from `size` below
@@ -127,8 +135,10 @@ class Config:
     background: Path | str | None = "auto"
 
     # which NASA star map "auto" renders from. '4k' is a 36 MB download, '8k'
-    # is 130 MB and only worth it past about 4096 pixels wide.
-    starmap: str = "4k"
+    # is 130 MB and only worth it past 4096 pixels wide. "auto" takes whichever
+    # is at least as big as the frame, so that a full-size render samples the
+    # map rather than upsampling it.
+    starmap: str = "auto"
 
     # linear gain applied to that map before it is encoded for the screen.
     # Raise it to bring the Milky Way up, lower it to keep the sky dark and
@@ -162,14 +172,19 @@ class Config:
 
     def __post_init__(self):
         if isinstance(self.size, str):
-            sizes = {**SIZES, "full": STARMAP_SIZES[self.starmap]}
-            if self.size not in sizes:
+            if self.size not in SIZES:
                 raise ValueError(f"'{self.size}' is not a frame size. Choose "
-                                 f"from {sorted(sizes)}, or give a "
+                                 f"from {list(SIZES)}, or give a "
                                  f"(width, height) pair.")
-            self.width, self.height = sizes[self.size]
+            self.width, self.height = SIZES[self.size]
         else:
             self.width, self.height = self.size
+
+        if self.starmap == "auto":
+            self.starmap = "8k" if self.width > STARMAP_SIZES["4k"][0] else "4k"
+        elif self.starmap not in STARMAP_SIZES:
+            raise ValueError(f"'{self.starmap}' is not a star map. Choose "
+                             f"from {list(STARMAP_SIZES)}, or 'auto'.")
 
         self.outdir = Path(self.outdir)
         if self.background not in (None, "auto"):
@@ -635,14 +650,14 @@ def restyle(base="stars_appearing", sample=None, notes=None, name=None,
 
 
 # the sounds to choose between, as the notebooks offer them
-SOUNDS = ["Night Harp", "Stars Appearing"]
+SOUNDS = ["Night Harp", "Glockenspiel"]
 
 
 def chosen_style(sound="Night Harp", cfg=None):
     """The style to sonify with, for one of the sounds in `SOUNDS`.
 
-    `"Stars Appearing"` is the glockenspiel of the original planetarium
-    piece, and is the `stars_appearing` style as it ships. `"Night Harp"`
+    `"Glockenspiel"` is the sound of the original planetarium piece, and
+    is the `stars_appearing` style as it ships. `"Night Harp"`
     keeps that same recipe and swaps only the sound it is made of - the
     Suite's harp samples, fetched once, and the chord of its own "Night
     Harp" style - so every mapping is left as it is.
@@ -658,7 +673,7 @@ def chosen_style(sound="Night Harp", cfg=None):
     if sound not in SOUNDS:
         raise ValueError(f"'{sound}' is not a sound. Choose from {SOUNDS}.")
 
-    if sound == "Stars Appearing":
+    if sound == "Glockenspiel":
         return "stars_appearing"
 
     cfg = cfg or Config()
