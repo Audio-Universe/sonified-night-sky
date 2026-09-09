@@ -32,6 +32,7 @@ import hashlib
 import json
 import shutil
 import subprocess
+import tempfile
 import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -1002,11 +1003,15 @@ def encode(cfg, audio, out_path, dome=False):
             *x264_args(cfg),
             "-c:a", "aac", "-b:a", "320k",
             "-r", str(cfg.fps),
-            # `-shortest` ends the video with the sound, but to do it ffmpeg
-            # holds every packet it might have to drop - ten seconds of them
-            # by default, which at this frame size is gigabytes. A tenth of a
-            # second is plenty, since the two are the same length anyway.
-            "-shortest", "-shortest_buf_duration", "0.1",
+            # the sound and the picture are both exactly `duration` long, so
+            # the end is simply stated rather than discovered. `-shortest`
+            # would do the same job, but to do it ffmpeg holds on to every
+            # packet it might still have to drop - ten seconds of them by
+            # default, which at these frame sizes is gigabytes. Capping that
+            # with `-shortest_buf_duration` works, but only on ffmpeg 6.1 and
+            # up, and Colab is still on 4.x, where the option is not
+            # recognised and ffmpeg exits before the first frame.
+            "-t", str(cfg.duration),
             str(out_path)]
 
 
@@ -1019,11 +1024,14 @@ def dome_from_panorama(cfg, panorama, out_path):
     chain = (f"[0:v]v360=e:fisheye:h_fov=180:v_fov=180:pitch={cfg.dome_pitch}"
              f":w={cfg.dome_size}:h={cfg.dome_size},format=yuv420p[v]")
 
-    subprocess.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-                    "-i", str(panorama), "-filter_complex", chain,
-                    "-map", "[v]", "-map", "0:a", *x264_args(cfg),
-                    "-c:a", "copy", "-r", str(cfg.fps), str(out_path)],
-                   check=True)
+    done = subprocess.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                           "-i", str(panorama), "-filter_complex", chain,
+                           "-map", "[v]", "-map", "0:a", *x264_args(cfg),
+                           "-c:a", "copy", "-r", str(cfg.fps), str(out_path)],
+                          capture_output=True, text=True)
+    if done.returncode:
+        raise RuntimeError(f"ffmpeg failed while writing {out_path}:\n"
+                           f"{done.stderr.strip()}")
 
     return out_path
 
@@ -1049,21 +1057,39 @@ def video_targets(cfg):
 
 
 def _pipe_frames(cfg, events, audio, out_path, dome, sky):
-    """Render every frame into one ffmpeg process, and wait for it."""
-    n_frames = int(round(cfg.duration * cfg.fps))
-    proc = subprocess.Popen(encode(cfg, audio, out_path, dome=dome),
-                            stdin=subprocess.PIPE)
-    try:
-        for frame in tqdm.tqdm(render_frames(events, cfg, sky=sky),
-                               total=n_frames, desc=out_path.name,
-                               unit="frame"):
-            proc.stdin.write(frame)
-    finally:
-        proc.stdin.close()
-        failed = proc.wait() != 0
+    """Render every frame into one ffmpeg process, and wait for it.
 
-    if failed:
-        raise RuntimeError(f"ffmpeg failed while writing {out_path}")
+    What ffmpeg says on the way out is kept, and raised with the failure.
+    An ffmpeg that objects to one of our flags is gone before the first
+    frame is written, and all that reaches the notebook by itself is a
+    `BrokenPipeError` from the write that followed - which says nothing
+    about what ffmpeg actually objected to.
+    """
+    n_frames = int(round(cfg.duration * cfg.fps))
+
+    with tempfile.TemporaryFile() as complaint:
+        proc = subprocess.Popen(encode(cfg, audio, out_path, dome=dome),
+                                stdin=subprocess.PIPE, stderr=complaint)
+        gone = False
+        try:
+            for frame in tqdm.tqdm(render_frames(events, cfg, sky=sky),
+                                   total=n_frames, desc=out_path.name,
+                                   unit="frame"):
+                proc.stdin.write(frame)
+        except BrokenPipeError:
+            gone = True          # ffmpeg has died; `wait` below has the reason
+        finally:
+            try:
+                proc.stdin.close()
+            except BrokenPipeError:
+                gone = True
+            status = proc.wait()
+
+        if status or gone:
+            complaint.seek(0)
+            said = complaint.read().decode(errors="replace").strip()
+            raise RuntimeError(f"ffmpeg failed while writing {out_path}"
+                               + (f":\n{said}" if said else "."))
 
     return out_path
 
