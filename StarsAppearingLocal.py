@@ -109,7 +109,9 @@ class Config:
     width: int = field(init=False, default=0)
     height: int = field(init=False, default=0)
 
-    # peak radius in pixels of the brightest and faintest star pulses
+    # peak radius in pixels of the brightest and faintest star pulses,
+    # quoted for a frame `STAR_SIZE_REFERENCE` tall and scaled from there, so
+    # that a pulse covers the same patch of sky at every frame size
     max_star_px: float = 15.0
     min_star_px: float = 1.0
 
@@ -773,6 +775,19 @@ def chosen_style(sound="Night Harp", cfg=None):
 # actually alive in each frame. And only the rows those stars touch are cleared
 # and converted, rather than the whole 4K canvas.
 
+# the frame height `Config.max_star_px` and `min_star_px` are quoted for. A
+# star pulse is a patch of *sky*, not a patch of screen, so its radius scales
+# with the frame: at 15 px on a 640-tall frame it covers 4.2 degrees, and it
+# stays 4.2 degrees at every other size rather than shrinking into a bigger
+# canvas. The reference is a little taller than the 512 of `preview`, which
+# had the pulses slightly too big for the frame.
+STAR_SIZE_REFERENCE = 640
+
+# below half a pixel a pulse is not drawn at all, so at the smallest frames
+# the faintest stars would drop out of the picture rather than merely being
+# small. This is the radius they are held at instead.
+STAR_PX_FLOOR = 0.75
+
 # how many rows of the canvas are composited at once. The working copy is
 # float32, so a whole 8192 x 4096 frame would be 400 MB of temporaries; a band
 # at a time keeps it to a few tens.
@@ -820,9 +835,16 @@ def render_frames(events, cfg, sky=None):
     cx = ((180.0 - events["azimuth"].to_numpy(float)) % 360.0) * (W / 360.0)
     cy = events["polar"].to_numpy(float) * (H / 180.0)
 
-    # peak radius: bright stars are big, faint ones small
+    # peak radius: bright stars are big, faint ones small. The sizes are
+    # quoted for a frame `STAR_SIZE_REFERENCE` tall, and scaled to this one,
+    # so that a bigger render gets bigger pulses rather than the same ones
+    # adrift in more sky.
+    scale = H / STAR_SIZE_REFERENCE
+    max_star = cfg.max_star_px * scale
+    min_star = max(cfg.min_star_px * scale, STAR_PX_FLOOR)
+
     brightness = 1 - unit_scale(events["magnitude"].to_numpy(float))
-    amp = 1.2 * (cfg.max_star_px * brightness + cfg.min_star_px)
+    amp = 1.2 * (max_star * brightness + min_star)
 
     # colour, clipped to the bulk of the B-V range so a few outliers do not
     # flatten everything else
@@ -1161,3 +1183,84 @@ def show_videos(paths):
     for path in paths:
         print(f"{Path(path).stat().st_size / 1e6:8.1f} MB  {path}")
         display(Video(str(path), embed=True))
+
+
+# a file this big or bigger is worth sending to Drive rather than through the
+# browser, which holds the whole thing in memory on the way past
+DRIVE_ADVISED_MB = 200
+
+
+def output_files(result):
+    """Everything one run wrote, videos first, then the sonification."""
+    if isinstance(result, Sequence):
+        return [Path(p) for p in result.videos] + [Path(result.audio)]
+    if isinstance(result, (str, Path)):
+        return [Path(result)]
+
+    return [Path(p) for p in result]
+
+
+def download_outputs(result):
+    """Offer each file this run wrote as a download button.
+
+    On `Colab` the outputs are written to a machine that is thrown away when
+    the session ends, and the file browser they are sitting in is not an
+    obvious place to look. `google.colab.files.download` is the same call the
+    file browser's own download button makes; hanging it off a click rather
+    than running it as the cell runs means the browser sees a download the
+    reader asked for, rather than one a page started by itself, which is the
+    kind it blocks.
+
+    Run anywhere else the files are already on your own machine, so there is
+    nothing to download and the paths are printed instead.
+
+    Args:
+      result (:obj:`Sequence`, :obj:`list` or :obj:`pathlib.Path`): a run, as
+        `make_sequence` returns it, or the paths themselves.
+    """
+    import html
+
+    from IPython.display import HTML, display
+
+    paths = [p for p in output_files(result) if p.exists()]
+
+    try:
+        import google.colab  # noqa: F401
+    except ImportError:
+        print("Your files are here:")
+        for path in paths:
+            print(f"  {path.stat().st_size / 1e6:8.1f} MB  {path.resolve()}")
+        return paths
+
+    buttons, bulky = [], []
+    for path in paths:
+        size = path.stat().st_size / 1e6
+        if size >= DRIVE_ADVISED_MB:
+            bulky.append(path)
+
+        # the path goes into the page as a JavaScript string inside an HTML
+        # attribute, so it is quoted for both
+        arg = html.escape(json.dumps(str(path.resolve())), quote=True)
+        buttons.append(
+            f"<div style='margin:6px 0'>"
+            f"<button onclick='google.colab.files.download({arg})' "
+            f"style='font-size:14px;padding:8px 14px;margin-right:10px;"
+            f"cursor:pointer;border-radius:6px;border:1px solid #999'>"
+            f"&#11015;&#160; Download {html.escape(path.name)}</button>"
+            f"<span style='color:#666'>{size:.1f} MB</span></div>")
+
+    note = ("<p style='color:#666;margin-top:10px'>These files are deleted "
+            "when the Colab session ends, so download anything you want to "
+            "keep.</p>")
+    if bulky:
+        note += ("<p style='color:#666'>A file this large can be slow or "
+                 "unreliable through the browser. To put it in your Google "
+                 "Drive instead, run:<br>"
+                 "<code>from google.colab import drive; "
+                 "drive.mount('/content/drive')</code><br>"
+                 "<code>!cp " + " ".join(html.escape(str(p)) for p in bulky)
+                 + " /content/drive/MyDrive/</code></p>")
+
+    display(HTML("".join(buttons) + note))
+
+    return paths
