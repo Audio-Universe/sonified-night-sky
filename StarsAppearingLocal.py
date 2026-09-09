@@ -635,6 +635,39 @@ def suite_samples(name="Harp", cache=None, ref="main"):
     return folder
 
 
+# Blue stars take the high notes: short wavelength of light onto short
+# wavelength of sound. The `stars_appearing` style says so itself, with
+# `function: invert` on its colour mapping - but the copy shipped with strauss
+# `v1p5`, which the Colab notebook installs, predates that line, and without it
+# the mapping runs the other way round and red stars sound high. Which strauss
+# is installed should not decide which way the piece runs, so it is put in here
+# rather than relied on there.
+
+def ensure_colour_invert(style):
+    """Give a style the colour -> pitch `invert` if it does not have it.
+
+    Idempotent: a style that already inverts is left alone, so this can
+    never invert twice and land back where it started.
+
+    Args:
+      style (:obj:`dict`): a style as `load_style` returns it, changed in
+        place.
+
+    Returns:
+      style (:obj:`dict`): the same style, mapping colour the right way.
+    """
+    for mapping in style.get("map", []):
+        if mapping.get("input") != "colour" or mapping.get("output") != "pitch":
+            continue
+
+        funcs = mapping.get("function") or []
+        funcs = [funcs] if isinstance(funcs, str) else list(funcs)
+        if "invert" not in funcs:
+            mapping["function"] = funcs + ["invert"]
+
+    return style
+
+
 def restyle(base="stars_appearing", sample=None, notes=None, name=None,
             description=None, out_path=None):
     """Write a copy of a strauss style, with a different instrument or chord.
@@ -642,7 +675,9 @@ def restyle(base="stars_appearing", sample=None, notes=None, name=None,
     The recipe itself - what maps to what, and how the notes are shaped -
     is left alone, so the sonification still sounds one note per star and
     still carries the same data. Only the sound the notes are made of, and
-    the chord they are drawn from, change.
+    the chord they are drawn from, change - with the one exception of
+    `ensure_colour_invert`, which fixes up a base style old enough to map
+    colour to pitch the wrong way round.
 
     Args:
       base (`optional`, :obj:`str`): the style to start from, by name or
@@ -665,7 +700,7 @@ def restyle(base="stars_appearing", sample=None, notes=None, name=None,
     import yaml
     from strauss.audio_figure import load_style
 
-    style = load_style(base)
+    style = ensure_colour_invert(load_style(base))
 
     if sample is not None:
         style.setdefault("generator", {})["sample"] = str(sample)
@@ -707,10 +742,14 @@ def chosen_style(sound="Night Harp", cfg=None):
     if sound not in SOUNDS:
         raise ValueError(f"'{sound}' is not a sound. Choose from {SOUNDS}.")
 
-    if sound == "Glockenspiel":
-        return "stars_appearing"
-
     cfg = cfg or Config()
+
+    if sound == "Glockenspiel":
+        # nothing to swap out, but it still goes through `restyle` so that
+        # `ensure_colour_invert` reaches it too
+        return restyle("stars_appearing",
+                       out_path=cfg.outdir / "stars_appearing_glock.yml")
+
     return restyle("stars_appearing",
                    sample=suite_samples("Harp", cfg.cache),
                    notes=NIGHT_HARP_NOTES,
