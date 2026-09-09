@@ -163,6 +163,12 @@ class Config:
     dome_pitch: float = 90.0                    # degrees to tilt the dome view up
     dome_size: int | None = None                # square edge; defaults to `height`
 
+    # how many threads x264 may use. Its frame-parallel threading keeps a
+    # frame in flight per thread, which at 8192 x 4096 is ~50 MB apiece, so
+    # the default is deliberately low and paired with sliced threading in
+    # `x264_args`. Raise it if you have the memory and want the speed.
+    encoder_threads: int = 2
+
     # -- reproducibility -------------------------------------------------
     # magnitudes are jittered to break ties, and notes detuned very slightly
     seed: int = 0
@@ -536,6 +542,34 @@ def resolve_background(cfg):
     return Path(cfg.background)
 
 
+def _decode_image(path, width, height):
+    """Read an image into an `(H, W, 3)` `uint8` array, scaled to the frame."""
+    raw = subprocess.run(
+        ["ffmpeg", "-v", "error", "-i", str(path),
+         "-vf", f"scale={width}:{height},setsar=1", "-f", "rawvideo",
+         "-pix_fmt", "rgb24", "-frames:v", "1", "-"],
+        capture_output=True, check=True).stdout
+
+    return np.frombuffer(raw, np.uint8).reshape(height, width, 3)
+
+
+def background_image(cfg, sky=None):
+    """The background panorama as pixels, ready for `render_frames`.
+
+    Args:
+      sky (:obj:`pathlib.Path`, optional): the image, as
+        `resolve_background` returns it. Left out, `cfg.background` decides.
+
+    Returns:
+      image (:obj:`numpy.ndarray` or :obj:`None`): an `(H, W, 3)` `uint8`
+        array, or `None` for a plain black sky.
+    """
+    if sky is None:
+        sky = resolve_background(cfg)
+
+    return None if sky is None else _decode_image(sky, cfg.width, cfg.height)
+
+
 # <u> __The sound design:__ </u>
 #
 # The *Sonification Suite* keeps a sound design of its own for this piece, "Night
@@ -690,8 +724,9 @@ def chosen_style(sound="Night Harp", cfg=None):
 # <u> __The animation:__ </u>
 #
 # Each star is a pulse that swells and fades as its note sounds. Frames are
-# generated as raw `RGBA` and piped straight into `ffmpeg` - no intermediate
-# `PNG`s, so nothing touches the disk between here and the finished video.
+# generated as raw `RGB`, background and all, and piped straight into `ffmpeg`
+# - no intermediate `PNG`s, so nothing touches the disk between here and the
+# finished video.
 #
 # Two things keep this quick. A star is only drawn while it is bigger than half
 # a pixel, which for these envelopes is around a second out of the whole piece,
@@ -699,13 +734,28 @@ def chosen_style(sound="Night Harp", cfg=None):
 # actually alive in each frame. And only the rows those stars touch are cleared
 # and converted, rather than the whole 4K canvas.
 
+# how many rows of the canvas are composited at once. The working copy is
+# float32, so a whole 8192 x 4096 frame would be 400 MB of temporaries; a band
+# at a time keeps it to a few tens.
+ROW_BAND = 512
+
 def star_rgb(bv01):
     """Colour of a star from its normalised `B-V`, 0 bluest to 1 reddest."""
     return 1 - 0.3 * (np.array([1.0, 0.5, 0.0]) - bv01) ** 2
 
 
-def render_frames(events, cfg):
-    """Yield one raw `RGBA` frame per frame of the animation.
+def render_frames(events, cfg, sky=None):
+    """Yield one raw `RGB` frame per frame of the animation.
+
+    The background is composited here rather than by `ffmpeg`. Handing
+    `ffmpeg` a looping still to overlay makes it hold a queue of full-size
+    decoded frames, which at 8192 x 4096 is 134 MB apiece and enough of them
+    to exhaust a 12 GB machine partway through a render. Doing it here keeps
+    exactly one frame in flight, and sends three bytes a pixel rather than
+    four.
+
+    The same buffer is handed out every time, so write each frame before
+    asking for the next rather than collecting them.
 
     Args:
       events (:obj:`pandas.DataFrame`): a row per star, with the columns
@@ -713,8 +763,15 @@ def render_frames(events, cfg):
         table - so that the picture cannot disagree with the sound - plus
         the `magnitude` and `colour` that were sonified, which set how big
         and what colour each pulse is.
+      sky (:obj:`numpy.ndarray`, optional): the background panorama as an
+        `(H, W, 3)` `uint8` array, as `background_image` returns it. `None`
+        gives a plain black sky.
     """
     W, H = cfg.width, cfg.height
+
+    if sky is not None and sky.shape != (H, W, 3):
+        raise ValueError(f"the background is {sky.shape}, but the frame is "
+                         f"{(H, W, 3)}.")
     n_frames = int(round(cfg.duration * cfg.fps))
 
     t_star = events["time"].to_numpy(float)
@@ -751,7 +808,12 @@ def render_frames(events, cfg):
     # premultiplied colour and coverage, reused between frames
     colour = np.zeros((H, W, 3), dtype=np.float32)
     alpha = np.zeros((H, W), dtype=np.float32)
-    out = np.zeros((H, W, 4), dtype=np.uint8)
+
+    # the frame itself starts as the background, and stays it everywhere no
+    # star reaches
+    out = np.zeros((H, W, 3), dtype=np.uint8)
+    if sky is not None:
+        out[:] = sky
 
     dirty = (0, H)
 
@@ -762,6 +824,7 @@ def render_frames(events, cfg):
         y0, y1 = dirty
         colour[y0:y1] = 0.0
         alpha[y0:y1] = 0.0
+        out[y0:y1] = 0 if sky is None else sky[y0:y1]
 
         lo = np.searchsorted(t_star, now - trail, side="left")
         hi = np.searchsorted(t_star, now + lead, side="right")
@@ -810,45 +873,56 @@ def render_frames(events, cfg):
 
             touched_lo, touched_hi = min(touched_lo, ys0), max(touched_hi, ys1)
 
-        # everything the stars did not touch stays fully transparent, so the
-        # background shows through untouched
-        out[:] = 0
-
-        if touched_hi > touched_lo:
-            sl = slice(touched_lo, touched_hi)
-            a = alpha[sl]
-            # undo the premultiplication, since ffmpeg expects straight alpha
-            np.multiply(colour[sl], 255.0 / np.maximum(a, 1e-6)[..., None],
-                        out=colour[sl])
-            out[sl, :, :3] = np.clip(colour[sl], 0, 255).astype(np.uint8)
-            out[sl, :, 3] = (a * 255).astype(np.uint8)
+        # lay the pulses over the background, a band of rows at a time so that
+        # a frame with stars from pole to pole never needs a float copy of the
+        # whole canvas. `colour` is already premultiplied by `alpha`, which is
+        # exactly what compositing over the background wants.
+        for band in range(touched_lo, touched_hi, ROW_BAND):
+            sl = slice(band, min(band + ROW_BAND, touched_hi))
+            over = colour[sl] * 255.0
+            if sky is not None:
+                over += sky[sl] * (1.0 - alpha[sl][..., None])
+            np.clip(over, 0, 255, out=over)
+            out[sl] = over.astype(np.uint8)
 
         dirty = (touched_lo, touched_hi) if touched_hi > touched_lo else (0, 0)
 
-        yield out.tobytes()
+        yield out.data
 
 
 # <u> __Compositing:__ </u>
 #
-# One `ffmpeg` pass does the lot: lay the star frames over the background
-# panorama, mux the rendered audio, and - for the dome master - reproject the
-# equirectangular result to fisheye with the `v360` filter.
+# `ffmpeg` takes finished frames and does the two things left: mux the rendered
+# audio, and - for the dome master - reproject the equirectangular picture to
+# fisheye with the `v360` filter.
+#
+# Both are done one `ffmpeg` at a time. At `full` size a frame is 100 MB of
+# `RGB` and 50 MB of `YUV`, and every buffer along the way holds one: the
+# encoder's threads, its lookahead, the muxer's queue. Two of these running
+# side by side, each with a looping still queueing up behind a slow pipe, is
+# what fills 12 GB partway through a render. So the panorama is written first,
+# and the dome is reprojected from it rather than raced against it.
 
-def encode(cfg, audio, out_path, sky=None, dome=False):
+def x264_args(cfg):
+    """The encoder settings, shared by every pass.
+
+    x264's frame-parallel threading keeps a frame in flight per thread, plus
+    the lookahead - fine at 1080p, several GB at 8192 x 4096. Sliced threading
+    keeps one frame and splits it between threads instead, and a short
+    lookahead costs very little at this bitrate.
+    """
+    return ["-c:v", "libx264", "-crf", "16", "-preset", "medium",
+            "-threads", str(cfg.encoder_threads),
+            "-x264-params", "sliced-threads=1:rc-lookahead=10:sync-lookahead=0"]
+
+
+def encode(cfg, audio, out_path, dome=False):
     """Build the ffmpeg command for one output, and return it.
 
-    Args:
-      sky (:obj:`pathlib.Path`, optional): the panorama to lay the stars
-        over, as returned by `resolve_background`. `None` gives black.
+    The frames arrive from `render_frames` with the background already in
+    them, so there is one video input and nothing to overlay.
     """
-    if sky is not None:
-        background = ["-loop", "1", "-framerate", str(cfg.fps), "-i", str(sky)]
-    else:
-        background = ["-f", "lavfi", "-i",
-                      f"color=c=black:s={cfg.width}x{cfg.height}:r={cfg.fps}"]
-
-    chain = (f"[0:v]scale={cfg.width}:{cfg.height},setsar=1,format=rgba[bg];"
-             "[bg][1:v]overlay=shortest=1[comp];[comp]")
+    chain = "[0:v]setsar=1,"
     if dome:
         # equirectangular in, fisheye out, tilted up so the zenith lands in
         # the middle of the dome
@@ -857,16 +931,40 @@ def encode(cfg, audio, out_path, sky=None, dome=False):
     chain += "format=yuv420p[v]"
 
     return ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-            *background,
-            "-f", "rawvideo", "-pixel_format", "rgba",
+            "-thread_queue_size", "8",
+            "-f", "rawvideo", "-pixel_format", "rgb24",
             "-video_size", f"{cfg.width}x{cfg.height}",
             "-framerate", str(cfg.fps), "-i", "pipe:0",
             "-i", str(audio),
             "-filter_complex", chain,
-            "-map", "[v]", "-map", "2:a",
-            "-c:v", "libx264", "-crf", "16", "-preset", "medium",
+            "-map", "[v]", "-map", "1:a",
+            *x264_args(cfg),
             "-c:a", "aac", "-b:a", "320k",
-            "-r", str(cfg.fps), "-shortest", str(out_path)]
+            "-r", str(cfg.fps),
+            # `-shortest` ends the video with the sound, but to do it ffmpeg
+            # holds every packet it might have to drop - ten seconds of them
+            # by default, which at this frame size is gigabytes. A tenth of a
+            # second is plenty, since the two are the same length anyway.
+            "-shortest", "-shortest_buf_duration", "0.1",
+            str(out_path)]
+
+
+def dome_from_panorama(cfg, panorama, out_path):
+    """Reproject a finished panorama video into the fisheye dome master.
+
+    Reading the panorama back costs one more encode, and saves holding a
+    second set of full-size frames while the first is still being written.
+    """
+    chain = (f"[0:v]v360=e:fisheye:h_fov=180:v_fov=180:pitch={cfg.dome_pitch}"
+             f":w={cfg.dome_size}:h={cfg.dome_size},format=yuv420p[v]")
+
+    subprocess.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                    "-i", str(panorama), "-filter_complex", chain,
+                    "-map", "[v]", "-map", "0:a", *x264_args(cfg),
+                    "-c:a", "copy", "-r", str(cfg.fps), str(out_path)],
+                   check=True)
+
+    return out_path
 
 
 def video_targets(cfg):
@@ -889,12 +987,33 @@ def video_targets(cfg):
     return wanted[cfg.output]
 
 
+def _pipe_frames(cfg, events, audio, out_path, dome, sky):
+    """Render every frame into one ffmpeg process, and wait for it."""
+    n_frames = int(round(cfg.duration * cfg.fps))
+    proc = subprocess.Popen(encode(cfg, audio, out_path, dome=dome),
+                            stdin=subprocess.PIPE)
+    try:
+        for frame in tqdm.tqdm(render_frames(events, cfg, sky=sky),
+                               total=n_frames, desc=out_path.name,
+                               unit="frame"):
+            proc.stdin.write(frame)
+    finally:
+        proc.stdin.close()
+        failed = proc.wait() != 0
+
+    if failed:
+        raise RuntimeError(f"ffmpeg failed while writing {out_path}")
+
+    return out_path
+
+
 def write_videos(cfg, events, audio, targets=None, sky=None):
-    """Render the frames once, into one ffmpeg process per output.
+    """Render the frames once, and derive any other output from the result.
 
     Asked for both the panorama and the dome master, they are the same
-    pixels reprojected differently, so they share a single pass of the
-    frame generator rather than drawing everything twice.
+    pixels reprojected differently. The frames are drawn once, into the
+    panorama, and the dome is reprojected from that - one `ffmpeg` at a
+    time, so that a full-size render's memory does not double.
 
     Args:
       targets (:obj:`list`, optional): `(path, dome)` pairs, one per
@@ -913,29 +1032,16 @@ def write_videos(cfg, events, audio, targets=None, sky=None):
 
     cfg.outdir.mkdir(parents=True, exist_ok=True)
 
-    if sky is None:
-        sky = resolve_background(cfg)
+    image = background_image(cfg, sky)
 
-    n_frames = int(round(cfg.duration * cfg.fps))
-    procs = [subprocess.Popen(encode(cfg, audio, path, sky=sky, dome=dome),
-                              stdin=subprocess.PIPE)
-             for path, dome in targets]
+    (first_path, first_dome), *rest = targets
+    _pipe_frames(cfg, events, audio, first_path, first_dome, image)
 
-    label = ", ".join(path.name for path, _ in targets)
-    try:
-        for frame in tqdm.tqdm(render_frames(events, cfg), total=n_frames,
-                               desc=label, unit="frame"):
-            for proc in procs:
-                proc.stdin.write(frame)
-    finally:
-        for proc in procs:
-            proc.stdin.close()
-        failed = [path for (path, _), proc in zip(targets, procs)
-                  if proc.wait() != 0]
-
-    if failed:
-        raise RuntimeError("ffmpeg failed while writing "
-                           f"{', '.join(str(p) for p in failed)}")
+    for path, dome in rest:
+        if dome and not first_dome:
+            dome_from_panorama(cfg, first_path, path)
+        else:
+            _pipe_frames(cfg, events, audio, path, dome, image)
 
     return [path for path, _ in targets]
 
