@@ -25,9 +25,10 @@
 # `strauss` itself, in the open, with the `stars_appearing` style carrying the
 # recipe.
 #
-# Extra requirements beyond `strauss`:  `pip install skyfield`
+# Extra requirements beyond `strauss`:  `pip install skyfield timezonefinder`
 # (and a working `ffmpeg` on your `PATH`).
 
+import difflib
 import hashlib
 import json
 import shutil
@@ -37,7 +38,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, available_timezones
 
 import numpy as np
 import pandas as pd
@@ -75,13 +76,19 @@ class Config:
     latitude: float = 53.1143737
     longitude: float = -1.2219389
     date_time: str = "2026-09-19 19:00:00"      # local wall-clock, YYYY-MM-DD HH:mm:ss
-    time_zone: str = "Europe/London"            # TZ identifier, e.g. 'Europe/London'
 
-    # which way is the listener/viewer facing? a cardinal point, and the
-    # centre of both the panorama and the stereo/surround image
+    # which zone that wall-clock time is read in. 'auto' looks up the zone in
+    # force at the coordinates above, so that summer time is applied or not
+    # according to the date; otherwise a TZ identifier, e.g. 'Europe/London'
+    time_zone: str = "auto"
+
+    # the centre of the panorama - the direction an observer is taken to be
+    # looking - and the centre of the stereo/surround image. A cardinal point.
     facing: str = "S"
 
-    # faintest star to include; larger numbers mean more, dimmer stars
+    # faintest star to include; larger numbers mean more, dimmer stars. Above
+    # a typical horizon that is around 250 stars at 4, 750 at 5 and 2500 at 6,
+    # and the more there are the longer the piece takes to make.
     mag_limit: float = 5.0
 
     # -- the sound -------------------------------------------------------
@@ -195,6 +202,20 @@ class Config:
             raise ValueError(f"'{self.starmap}' is not a star map. Choose "
                              f"from {list(STARMAP_SIZES)}, or 'auto'.")
 
+        # settled here rather than where it is used, so that `time_zone` is a
+        # real zone everywhere - including the panorama's cache digest, which
+        # would otherwise key on the word "auto" - and so that a zone that is
+        # not a zone is caught while the settings are still on screen
+        if self.time_zone == "auto":
+            self.time_zone = resolve_timezone(self.latitude, self.longitude)
+        elif self.time_zone not in available_timezones():
+            near = difflib.get_close_matches(self.time_zone,
+                                             available_timezones(), n=3)
+            raise ValueError(f"'{self.time_zone}' is not a timezone."
+                             + (f" Did you mean: {', '.join(near)}?" if near
+                                else " Use 'auto' to take it from the "
+                                     "coordinates."))
+
         self.outdir = Path(self.outdir)
         if self.background not in (None, "auto"):
             self.background = Path(self.background)
@@ -226,6 +247,66 @@ def unit_scale(values):
         return np.full(values.shape, 0.5)
 
     return (values - low) / (high - low)
+
+
+def resolve_timezone(latitude, longitude):
+    """The timezone in force at a place, as a TZ identifier.
+
+    Nobody should have to know their own entry in the TZ database to point
+    this at their own site, and a name typed by hand is a name that can be
+    typed wrong. The zone is a property of the coordinates, so we look it up
+    from them - and since it is only the *name* we take, the date decides
+    whether summer time applies, not this.
+
+    Args:
+      latitude (:obj:`float`): degrees north.
+      longitude (:obj:`float`): degrees east.
+
+    Returns:
+      name (:obj:`str`): a TZ identifier, e.g. `'Europe/London'`.
+    """
+    try:
+        from timezonefinder import TimezoneFinder
+    except ImportError:
+        raise ImportError(
+            "Working the timezone out from the coordinates needs "
+            "`timezonefinder` - `pip install timezonefinder` - or give "
+            "`time_zone` a name like 'Europe/London' instead of 'auto'."
+        ) from None
+
+    name = TimezoneFinder().timezone_at(lat=latitude, lng=longitude)
+    if name is None:
+        # open ocean, or coordinates outside the map altogether
+        raise ValueError(f"No timezone found at {latitude}, {longitude}. "
+                         f"Give `time_zone` a name instead of 'auto'.")
+
+    return name
+
+
+def local_time(cfg):
+    """The configured instant, as an aware `datetime`.
+
+    `date_time` is wall-clock time as a clock at the site would read it, so
+    the zone is what turns it into an instant - and applies summer time, or
+    not, according to the date.
+    """
+    when = datetime.strptime(cfg.date_time, "%Y-%m-%d %H:%M:%S")
+
+    return when.replace(tzinfo=ZoneInfo(cfg.time_zone))
+
+
+def describe_when(cfg):
+    """One line saying which instant the settings picked out.
+
+    The zone is worked out rather than typed, so this is the only evidence a
+    form gives that it landed where the user meant - hence the abbreviation
+    and the offset, which is what tells summer time from winter.
+    """
+    when = local_time(cfg)
+    offset = f"{when:%z}"                       # +0100, and we want +01:00
+
+    return (f"{when:%Y-%m-%d %H:%M} {cfg.time_zone} - "
+            f"{when:%Z} (UTC{offset[:3]}:{offset[3:]})")
 
 
 def facing_degrees(facing):
@@ -272,9 +353,7 @@ def observed_sky(cfg):
     loader = Loader(str(cfg.cache), verbose=True)
     cat = load_catalogue(cfg, loader)
 
-    when = datetime.strptime(cfg.date_time, "%Y-%m-%d %H:%M:%S")
-    when = when.replace(tzinfo=ZoneInfo(cfg.time_zone))
-    t = loader.timescale().from_datetime(when)
+    t = loader.timescale().from_datetime(local_time(cfg))
 
     earth = loader("de421.bsp")["earth"]
     observer = (earth + wgs84.latlon(cfg.latitude, cfg.longitude)).at(t)
@@ -479,9 +558,7 @@ def sky_panorama(cfg, out_path=None):
                         cfg.cache / f"starmap_2020_{cfg.starmap}.exr")
 
     loader = Loader(str(cfg.cache), verbose=True)
-    when = datetime.strptime(cfg.date_time, "%Y-%m-%d %H:%M:%S")
-    when = when.replace(tzinfo=ZoneInfo(cfg.time_zone))
-    t = loader.timescale().from_datetime(when)
+    t = loader.timescale().from_datetime(local_time(cfg))
 
     earth = loader("de421.bsp")["earth"]
     observer = (earth + wgs84.latlon(cfg.latitude, cfg.longitude)).at(t)
