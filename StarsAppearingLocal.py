@@ -34,6 +34,7 @@ import json
 import shutil
 import subprocess
 import tempfile
+import textwrap
 import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -90,6 +91,12 @@ class Config:
     # a typical horizon that is around 250 stars at 4, 750 at 5 and 2500 at 6,
     # and the more there are the longer the piece takes to make.
     mag_limit: float = 5.0
+
+    # sonify a single figure rather than the whole sky: a constellation name,
+    # e.g. 'Orion', and only the stars its lines join are sounded and drawn.
+    # The piece is still paced against the whole sky, so those stars sound
+    # when they would have anyway. None is the whole sky.
+    constellation: str | None = None
 
     # -- the sound -------------------------------------------------------
     # passed to `strauss.sonify`, and used here to work out how many frames
@@ -234,15 +241,22 @@ CARDINALS = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
              "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"]
 
 
-def unit_scale(values):
+def unit_scale(values, lims=None):
     """Scale values onto 0-1.
 
     A handful of stars can share a magnitude or a colour exactly - a
     single constellation, say - which would otherwise divide by a zero
     range. Those degenerate cases land in the middle of the scale.
+
+    Args:
+      values (:obj:`numpy.ndarray`): what to scale.
+      lims (`optional`, :obj:`tuple`): the range to scale against, where
+        that is something other than the values' own. Sonifying part of the
+        sky wants the whole sky's range, so that the part keeps the place
+        in it that it had.
     """
     values = np.asarray(values, dtype=float)
-    low, high = values.min(), values.max()
+    low, high = lims if lims is not None else (values.min(), values.max())
     if not np.isfinite(high - low) or high == low:
         return np.full(values.shape, 0.5)
 
@@ -375,7 +389,7 @@ def observed_sky(cfg):
     return sky.sort_values("magnitude")
 
 
-def star_frame(sky, cfg):
+def star_frame(sky, cfg, lims=None):
     """The columns the `stars_appearing` style asks for, one row per star.
 
     The column names are the style's `input:` names - `sonify` matches a
@@ -393,12 +407,16 @@ def star_frame(sky, cfg):
 
     Args:
       sky (:obj:`pandas.DataFrame`): as `observed_sky` returns.
+      lims (`optional`, :obj:`tuple`): magnitude range to scale `volume`
+        against. Defaults to the range of `sky` itself; sonifying one
+        constellation passes the whole sky's range, so that its stars are
+        as loud as they would have been in the full piece.
 
     Returns:
       frame (:obj:`pandas.DataFrame`): ready for `strauss.sonify`, indexed
         by `HIP<number>` so each note can be traced back to its star.
     """
-    smag = unit_scale(sky["magnitude"].to_numpy(float))
+    smag = unit_scale(sky["magnitude"].to_numpy(float), lims)
     rng = np.random.default_rng(cfg.seed + 1)
 
     return pd.DataFrame({
@@ -441,6 +459,153 @@ def sonified_events(frame):
     }, index=flat["Source"].to_numpy())
 
     return events.join(frame[["magnitude", "colour"]]).sort_values("time")
+
+
+# <u> __One constellation at a time:__ </u>
+#
+# A planetarium session often wants a single figure rather than the whole sky -
+# "here is Orion, listen to it appear". The stars that make up a figure are the
+# ones its lines join, which is a *drawing* rather than anything in the
+# catalogue, so they come from `Stellarium`'s constellation lines, by way of
+# `skyfield`'s parser for them.
+#
+# The important part is what does *not* change: the magnitude range the piece is
+# paced against stays the whole sky's, so each star sounds at the instant, and
+# at the volume, it would have had in the full piece. A constellation is an
+# excerpt of the sky, not a piece rescaled to itself.
+
+# Stellarium restructured its sky cultures and these files are no longer on its
+# default branch, so the tag is pinned. `modern_st` is the Sky & Telescope set
+# of figures - the same file the Sonification Suite carries.
+CONSTELLATION_URL = ("https://raw.githubusercontent.com/Stellarium/stellarium/"
+                     "v24.1/skycultures/modern_st/constellationship.fab")
+
+
+def constellation_names():
+    """Every constellation that can be asked for, in alphabetical order."""
+    from skyfield.api import load_constellation_names
+
+    return sorted(name for _, name in load_constellation_names())
+
+
+def constellation_shapes(cache=None):
+    """The lines each constellation is drawn with, keyed by IAU abbreviation.
+
+    Args:
+      cache (`optional`, :obj:`pathlib.Path`): where the downloaded line
+        data is kept. Defaults to the same cache as everything else.
+
+    Returns:
+      shapes (:obj:`dict`): abbreviation -> list of `(hip, hip)` edges.
+    """
+    from skyfield.data import stellarium
+
+    cache = Path(cache or Config.cache)
+    path = _download(CONSTELLATION_URL, cache / "constellationship.fab")
+
+    with open(path, "rb") as f:
+        return dict(stellarium.parse_constellations(f))
+
+
+def asterism_stars(constellation, cache=None):
+    """The `Hipparcos` numbers of the stars a figure is drawn from.
+
+    Args:
+      constellation (:obj:`str`): the full name, e.g. `'Orion'`.
+      cache (`optional`, :obj:`pathlib.Path`): as `constellation_shapes`.
+
+    Returns:
+      hips (:obj:`list`): the stars joined by that figure's lines.
+    """
+    from skyfield.api import load_constellation_names
+
+    abbreviations = {name: abbrev
+                     for abbrev, name in load_constellation_names()}
+    if constellation not in abbreviations:
+        near = difflib.get_close_matches(constellation, abbreviations, n=3)
+        raise ValueError(f"'{constellation}' is not a constellation."
+                         + (f" Did you mean: {', '.join(near)}?" if near
+                            else ""))
+
+    edges = constellation_shapes(cache)[abbreviations[constellation]]
+
+    return sorted({hip for edge in edges for hip in edge})
+
+
+def full_sky_limits(sky):
+    """The magnitude range of the whole sky, for a piece that is part of it.
+
+    This is what `volume` is scaled against, so that a constellation's
+    stars are as loud as they would have been among all the rest.
+    """
+    magnitudes = np.asarray(sky["magnitude"], dtype=float)
+
+    return (magnitudes.min(), magnitudes.max())
+
+
+def time_limits(lims):
+    """The same range, as the style paces time over it.
+
+    `stars_appearing` maps magnitude to time over `["0%", "110%"]` of
+    whatever it is handed - percentiles, and the `110%` leaves the faintest
+    star short of the end rather than exactly on it. Written out as numbers
+    over the whole sky, the same limits can be given to a piece that sounds
+    only part of it, and then each star sounds when it would have anyway.
+    """
+    low, high = lims
+
+    return (low, low + 1.1 * (high - low))
+
+
+def constellation_sky(sky, cfg):
+    """The rows of `sky` that make up `cfg.constellation`.
+
+    Also the horizon check, which lives here so that it happens on the way
+    to the stars rather than as a step someone could forget: a figure that
+    has not risen has nothing to sonify, and finding that out after the
+    star map has downloaded is finding it out too late.
+
+    Args:
+      sky (:obj:`pandas.DataFrame`): as `observed_sky` returns.
+      cfg (:obj:`Config`): for the constellation, the magnitude limit and
+        the cache.
+
+    Returns:
+      chosen (:obj:`pandas.DataFrame`): the figure's stars, above the
+        horizon and within the magnitude limit.
+    """
+    hips = asterism_stars(cfg.constellation, cfg.cache)
+    chosen = sky[sky.index.isin(hips)]
+
+    if len(chosen):
+        print(f"{cfg.constellation}: {len(chosen)} of {len(hips)} stars, "
+              f"above the horizon and brighter than magnitude "
+              f"{cfg.mag_limit}")
+        return chosen
+
+    # nothing of it is up, so say which figures are - most complete first,
+    # since a figure with one star showing is not much of an answer
+    shapes = constellation_shapes(cfg.cache)
+    from skyfield.api import load_constellation_names
+    named = dict(load_constellation_names())
+
+    risen = []
+    for abbrev, edges in shapes.items():
+        stars = {hip for edge in edges for hip in edge}
+        up = len(stars & set(sky.index))
+        if up:
+            risen.append((up / len(stars), up, len(stars), named[abbrev]))
+
+    available = ", ".join(f"{name} ({up}/{total})"
+                          for _, up, total, name in sorted(risen, reverse=True))
+
+    raise ValueError(
+        f"None of {cfg.constellation} is above the horizon at "
+        f"{cfg.latitude}, {cfg.longitude} on {cfg.date_time} "
+        f"({cfg.time_zone}).\n\nChoose one of these instead, or another "
+        f"night - the count is how much of each figure is up:\n\n"
+        + textwrap.fill(available, width=72) + "\n"
+    )
 
 
 # <u> __The background sky:__ </u>
@@ -749,7 +914,8 @@ def ensure_colour_invert(style):
 
 
 def restyle(base="stars_appearing", sample=None, notes=None, name=None,
-            description=None, out_path=None):
+            description=None, input_ranges=None, merge_events=True,
+            out_path=None):
     """Write a copy of a strauss style, with a different instrument or chord.
 
     The recipe itself - what maps to what, and how the notes are shaped -
@@ -770,6 +936,16 @@ def restyle(base="stars_appearing", sample=None, notes=None, name=None,
         wherever the base style's name describes the sound it no longer
         has.
       description (`optional`, :obj:`str`): likewise for its description.
+      input_ranges (`optional`, :obj:`dict`): input name -> `(low, high)`,
+        replacing the range that input is mapped over. The style's own are
+        percentiles of whatever it is handed, which is the wrong thing when
+        it is handed part of the sky rather than all of it - `strauss`
+        reads a number as an absolute limit and a string as a percentile.
+      merge_events (`optional`, :obj:`bool`): keep the style's
+        `max_notes_per_sec`, which thins events that fall too close
+        together to be heard apart. Worth having for a whole sky, where
+        thousands of stars sound; not for a handful, where every note
+        thinned away is a star that does not sound at all.
       out_path (`optional`, :obj:`pathlib.Path`): where to write the
         style. Defaults to `<base>_restyled.yml` in the working directory.
 
@@ -791,6 +967,21 @@ def restyle(base="stars_appearing", sample=None, notes=None, name=None,
     if description is not None:
         style["description"] = description
 
+    if not merge_events:
+        # the field is optional and skipped when absent; it cannot be set to
+        # zero, since the style schema will only accept 1 to 20
+        style.pop("max_notes_per_sec", None)
+
+    for input_name, (low, high) in (input_ranges or {}).items():
+        for mapping in style.get("map", []):
+            if mapping.get("input") == input_name:
+                mapping["input_range"] = [float(low), float(high)]
+                break
+        else:
+            raise ValueError(f"'{input_name}' is not mapped by the "
+                             f"'{style.get('name', base)}' style, so it has "
+                             f"no range to set.")
+
     out_path = Path(out_path or f"{Path(base).stem}_restyled.yml")
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(yaml.safe_dump(style, sort_keys=False))
@@ -802,7 +993,8 @@ def restyle(base="stars_appearing", sample=None, notes=None, name=None,
 SOUNDS = ["Night Harp", "Glockenspiel"]
 
 
-def chosen_style(sound="Night Harp", cfg=None):
+def chosen_style(sound="Night Harp", cfg=None, input_ranges=None,
+                 merge_events=True):
     """The style to sonify with, for one of the sounds in `SOUNDS`.
 
     `"Glockenspiel"` is the sound of the original planetarium piece, and
@@ -815,6 +1007,9 @@ def chosen_style(sound="Night Harp", cfg=None):
       sound (`optional`, :obj:`str`): one of `SOUNDS`.
       cfg (`optional`, :obj:`Config`): for the sample cache, and for where
         a restyled style file is written.
+      input_ranges (`optional`, :obj:`dict`): passed to `restyle`, to pace
+        the piece against a range other than its own data's.
+      merge_events (`optional`, :obj:`bool`): passed to `restyle`.
 
     Returns:
       style (:obj:`str`): a style name or path, for `strauss.sonify`.
@@ -827,7 +1022,8 @@ def chosen_style(sound="Night Harp", cfg=None):
     if sound == "Glockenspiel":
         # nothing to swap out, but it still goes through `restyle` so that
         # `ensure_colour_invert` reaches it too
-        return restyle("stars_appearing",
+        return restyle("stars_appearing", input_ranges=input_ranges,
+                       merge_events=merge_events,
                        out_path=cfg.outdir / "stars_appearing_glock.yml")
 
     return restyle("stars_appearing",
@@ -837,6 +1033,8 @@ def chosen_style(sound="Night Harp", cfg=None):
                    description="Brightest stars appear first, pitch mapped to "
                                "colour. Harp and chord from the Sonification "
                                "Suite's 'Night Harp'.",
+                   input_ranges=input_ranges,
+                   merge_events=merge_events,
                    out_path=cfg.outdir / "stars_appearing_harp.yml")
 
 
@@ -1251,10 +1449,26 @@ def make_sequence(cfg, sound="Night Harp"):
     cfg.outdir.mkdir(parents=True, exist_ok=True)
 
     sky = observed_sky(cfg)
+
+    # one figure rather than the sky, if asked for - and *before* the
+    # background, which is the first step that downloads or renders anything,
+    # so that a constellation which has not risen costs a few seconds rather
+    # than a star map
+    lims = None
+    if cfg.constellation:
+        lims = full_sky_limits(sky)
+        sky = constellation_sky(sky, cfg)
+
     background = resolve_background(cfg)
 
-    frame = star_frame(sky, cfg)
-    style = chosen_style(sound, cfg)
+    frame = star_frame(sky, cfg, lims)
+    # a whole sky has thousands of stars and wants thinning where they pile
+    # up; one figure has a handful, and every note thinned from it is a star
+    # that never sounds
+    style = chosen_style(sound, cfg,
+                         input_ranges=None if lims is None
+                         else {"magnitude": time_limits(lims)},
+                         merge_events=cfg.constellation is None)
 
     strauss.sonify(frame, style=style, channels=cfg.system,
                    duration=cfg.duration, angle_unit="degrees",
