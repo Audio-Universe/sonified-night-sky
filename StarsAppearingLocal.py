@@ -323,6 +323,20 @@ def describe_when(cfg):
             f"{when:%Z} (UTC{offset[:3]}:{offset[3:]})")
 
 
+def describe_sky(cfg):
+    """One line saying how many stars the settings picked out.
+
+    The count is what `mag_limit` actually buys, and the only evidence a
+    form gives that the site and instant have any sky at all - a limit set
+    too low, or an afternoon, comes out as a handful of stars or none.
+    Computes the sky, so the first call fetches the catalogue and ephemeris.
+    """
+    sky = observed_sky(cfg)
+
+    return (f"{len(sky)} stars above the horizon brighter than magnitude "
+            f"{cfg.mag_limit}")
+
+
 def facing_degrees(facing):
     """Bearing of a cardinal point in degrees clockwise from north."""
     if facing not in CARDINALS:
