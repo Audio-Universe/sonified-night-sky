@@ -98,6 +98,13 @@ class Config:
     # when they would have anyway. None is the whole sky.
     constellation: str | None = None
 
+    # how much the dimmer stars are quietened: each star's volume is
+    # 1 / (rank + 1) ** volume_power, ranked from the brightest. Dim stars
+    # are far more numerous, so they crowd in as the piece goes on; 0.5
+    # keeps the summed loudness roughly even from start to end, 0 plays
+    # every star at full volume. The original planetarium piece used 0.2.
+    volume_power: float = 0.5
+
     # -- the sound -------------------------------------------------------
     # passed to `strauss.sonify`, and used here to work out how many frames
     # the animation needs. The *sound itself* is chosen by the strauss style,
@@ -400,7 +407,12 @@ def observed_sky(cfg):
     rng = np.random.default_rng(cfg.seed)
     sky["magnitude"] += 1e-2 * rng.random(len(sky))
 
-    return sky.sort_values("magnitude")
+    sky = sky.sort_values("magnitude")
+    # brightest first, so a star's rank is how many sound before it - kept
+    # on the sky so that a constellation cut from it keeps its stars' ranks
+    sky["rank"] = np.arange(len(sky))
+
+    return sky
 
 
 def star_frame(sky, cfg, lims=None):
@@ -414,24 +426,29 @@ def star_frame(sky, cfg, lims=None):
         while astronomical azimuth runs **clockwise from north**, so it is
         the facing direction *minus* the star's azimuth.
       - `polar` is measured from the zenith down, not the horizon up.
-      - `volume` quietens the dimmer stars. They are far more numerous, so
-        without this the piece grows steadily louder as it goes. Linear in
-        magnitude down to a floor of 0.1, as the Suite's "Night Harp" has
-        it, so the faintest star is quiet rather than silent.
+      - `volume` quietens the dimmer stars by their rank, as the original
+        planetarium piece did. They are far more numerous, so without this
+        the piece grows steadily louder as it goes; `Config.volume_power`
+        sets how much. Ranked over the whole sky even when only a
+        constellation is sounded, so its stars are as loud as they would
+        have been in the full piece.
       - `pitch_shift` detunes each note very slightly, so that the many
         stars sharing a note do not phase against one another.
 
     Args:
-      sky (:obj:`pandas.DataFrame`): as `observed_sky` returns.
-      lims (`optional`, :obj:`tuple`): magnitude range to scale `volume`
+      sky (:obj:`pandas.DataFrame`): as `observed_sky` returns, or a part
+        of it.
+      cfg (:obj:`Config`): for `facing`, `volume_power` and `seed`.
+      lims (`optional`, :obj:`tuple`): magnitude range to scale `smag`
         against. Defaults to the range of `sky` itself; sonifying one
-        constellation passes the whole sky's range, so that its stars are
-        as loud as they would have been in the full piece.
+        constellation passes the whole sky's range, so that its stars keep
+        the place in it they had.
 
     Returns:
       frame (:obj:`pandas.DataFrame`): ready for `strauss.sonify`, indexed
         by `HIP<number>` so each note can be traced back to its star.
     """
+    rank = sky["rank"].to_numpy(float)
     smag = unit_scale(sky["magnitude"].to_numpy(float), lims)
     rng = np.random.default_rng(cfg.seed + 1)
 
@@ -440,7 +457,7 @@ def star_frame(sky, cfg, lims=None):
         "colour":    sky["bv"].to_numpy(float),
         "azimuth":   (facing_degrees(cfg.facing) - sky["az"].to_numpy(float)) % 360,
         "polar":     90.0 - sky["alt"].to_numpy(float),
-        "volume":    0.1 + 0.9 * (1 - smag),
+        "volume":    0.1 + 0.9*(1-smag), #(1 + rank) ** -cfg.volume_power,
         "pitch_shift": 5e-3 * rng.random(len(sky)),
     }, index=[f"HIP{hip}" for hip in sky.index])
 
@@ -929,6 +946,38 @@ def ensure_colour_invert(style):
     return style
 
 
+# the maps `star_frame` feeds that not every copy of the base style carries.
+# Given absolute ranges, so that strauss takes the values as they are rather
+# than stretching them between their own percentiles - a volume curve that
+# ends at 0.2 should end at 0.2, not at silence
+STAR_MAPS = [
+    {"input": "volume", "input_range": [0.0, 1.0], "output": "volume"},
+    {"input": "pitch_shift", "input_range": [0.0, 1.0], "output": "pitch_shift"},
+]
+
+
+def ensure_star_maps(style):
+    """Give a style the `volume` and `pitch_shift` maps if it lacks them.
+
+    Appended rather than inserted, so that a style's existing maps keep
+    their positions. Idempotent.
+
+    Args:
+      style (:obj:`dict`): a style as `load_style` returns it, changed in
+        place.
+
+    Returns:
+      style (:obj:`dict`): the same style, mapping everything the frame has.
+    """
+    maps = style.setdefault("map", [])
+    outputs = {m.get("output") for m in maps}
+    for wanted in STAR_MAPS:
+        if wanted["output"] not in outputs:
+            maps.append(dict(wanted))
+
+    return style
+
+
 def restyle(base="stars_appearing", sample=None, notes=None, name=None,
             description=None, input_ranges=None, merge_events=False,
             out_path=None):
@@ -938,8 +987,9 @@ def restyle(base="stars_appearing", sample=None, notes=None, name=None,
     is left alone, so the sonification still sounds one note per star and
     still carries the same data. Only the sound the notes are made of, and
     the chord they are drawn from, change - with the one exception of
-    `ensure_colour_invert`, which fixes up a base style old enough to map
-    colour to pitch the wrong way round.
+    `ensure_colour_invert` and `ensure_star_maps`, which fix up a base
+    style that maps colour to pitch the wrong way round, or that is
+    missing the volume and detune maps.
 
     Args:
       base (`optional`, :obj:`str`): the style to start from, by name or
@@ -971,7 +1021,7 @@ def restyle(base="stars_appearing", sample=None, notes=None, name=None,
     import yaml
     from strauss.audio_figure import load_style
 
-    style = ensure_colour_invert(load_style(base))
+    style = ensure_star_maps(ensure_colour_invert(load_style(base)))
 
     if sample is not None:
         style.setdefault("generator", {})["sample"] = str(sample)
