@@ -914,7 +914,7 @@ def ensure_colour_invert(style):
 
 
 def restyle(base="stars_appearing", sample=None, notes=None, name=None,
-            description=None, input_ranges=None, merge_events=True,
+            description=None, input_ranges=None, merge_events=False,
             out_path=None):
     """Write a copy of a strauss style, with a different instrument or chord.
 
@@ -943,9 +943,8 @@ def restyle(base="stars_appearing", sample=None, notes=None, name=None,
         reads a number as an absolute limit and a string as a percentile.
       merge_events (`optional`, :obj:`bool`): keep the style's
         `max_notes_per_sec`, which thins events that fall too close
-        together to be heard apart. Worth having for a whole sky, where
-        thousands of stars sound; not for a handful, where every note
-        thinned away is a star that does not sound at all.
+        together to be heard apart. Every note thinned away is a star
+        that does not sound at all, so the notebooks turn it off.
       out_path (`optional`, :obj:`pathlib.Path`): where to write the
         style. Defaults to `<base>_restyled.yml` in the working directory.
 
@@ -994,7 +993,7 @@ SOUNDS = ["Night Harp", "Glockenspiel"]
 
 
 def chosen_style(sound="Night Harp", cfg=None, input_ranges=None,
-                 merge_events=True):
+                 merge_events=False):
     """The style to sonify with, for one of the sounds in `SOUNDS`.
 
     `"Glockenspiel"` is the sound of the original planetarium piece, and
@@ -1462,13 +1461,11 @@ def make_sequence(cfg, sound="Night Harp"):
     background = resolve_background(cfg)
 
     frame = star_frame(sky, cfg, lims)
-    # a whole sky has thousands of stars and wants thinning where they pile
-    # up; one figure has a handful, and every note thinned from it is a star
-    # that never sounds
+    # Avoid merging sources as in the Suite.
     style = chosen_style(sound, cfg,
                          input_ranges=None if lims is None
                          else {"magnitude": time_limits(lims)},
-                         merge_events=cfg.constellation is None)
+                         merge_events=False)
 
     strauss.sonify(frame, style=style, channels=cfg.system,
                    duration=cfg.duration, angle_unit="degrees",
