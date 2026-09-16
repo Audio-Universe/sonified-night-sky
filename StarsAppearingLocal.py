@@ -415,7 +415,9 @@ def star_frame(sky, cfg, lims=None):
         the facing direction *minus* the star's azimuth.
       - `polar` is measured from the zenith down, not the horizon up.
       - `volume` quietens the dimmer stars. They are far more numerous, so
-        without this the piece grows steadily louder as it goes.
+        without this the piece grows steadily louder as it goes. Linear in
+        magnitude down to a floor of 0.1, as the Suite's "Night Harp" has
+        it, so the faintest star is quiet rather than silent.
       - `pitch_shift` detunes each note very slightly, so that the many
         stars sharing a note do not phase against one another.
 
@@ -438,7 +440,7 @@ def star_frame(sky, cfg, lims=None):
         "colour":    sky["bv"].to_numpy(float),
         "azimuth":   (facing_degrees(cfg.facing) - sky["az"].to_numpy(float)) % 360,
         "polar":     90.0 - sky["alt"].to_numpy(float),
-        "volume":    (1 - smag) ** 0.5,
+        "volume":    0.1 + 0.9 * (1 - smag),
         "pitch_shift": 5e-3 * rng.random(len(sky)),
     }, index=[f"HIP{hip}" for hip in sky.index])
 
