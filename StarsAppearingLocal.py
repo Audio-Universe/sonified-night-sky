@@ -352,11 +352,28 @@ def facing_degrees(facing):
     return 360.0 * CARDINALS.index(facing) / len(CARDINALS)
 
 
+# tried before skyfield's CDS address, which is hanging as of writing
+HIPPARCOS_MIRRORS = (
+    "https://vizier.cfa.harvard.edu/ftp/cats/I/239/hip_main.dat",
+    "https://raw.githubusercontent.com/Audio-Universe/sonification-suite/"
+    "main/src/backend/hip_main.dat",
+)
+
+
 def load_catalogue(cfg, loader):
     """Read the Hipparcos catalogue, keeping stars we could plausibly show."""
     from skyfield.data import hipparcos
 
-    with loader.open(hipparcos.URL) as f:
+    for url in (*HIPPARCOS_MIRRORS, hipparcos.URL):
+        try:
+            f = loader.open(url)
+            break
+        except OSError as error:
+            print(f"Hipparcos catalogue unavailable: {error}")
+    else:
+        raise OSError("Could not download the Hipparcos catalogue.")
+
+    with f:
         cat = pd.read_csv(
             f, sep="|", names=hipparcos._COLUMN_NAMES, compression=None,
             usecols=["HIP", "Vmag", "RAdeg", "DEdeg", "Plx", "pmRA", "pmDE", "B-V"],
